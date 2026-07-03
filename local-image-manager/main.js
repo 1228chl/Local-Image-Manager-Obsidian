@@ -1,11 +1,11 @@
-const { Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, Menu } = require('obsidian');
 
 // ========== 默认设置 ==========
 const DEFAULT_SETTINGS = {
-    baseFolder: 'Assets/Image',        // 基础存储目录
-    maxHeadingDepth: 6,                // 文件名最大标题深度
-    uploadOnPaste: 'always',           // 'always' 或 'ask'
-    linkFormat: 'wiki',                // 'wiki' 或 'markdown'
+    baseFolder: 'Assets/Image',
+    maxHeadingDepth: 6,
+    uploadOnPaste: 'always',
+    linkFormat: 'wiki', // 'wiki' 或 'markdown'
 };
 
 // ========== 主插件类 ==========
@@ -14,11 +14,9 @@ class LocalImageManager extends Plugin {
         await this.loadSettings();
         this.addSettingTab(new SettingTab(this.app, this));
 
-        // 注册粘贴和拖拽事件
         this.registerEvent(this.app.workspace.on('editor-paste', this.handlePaste.bind(this)));
         this.registerEvent(this.app.workspace.on('editor-drop', this.handleDrop.bind(this)));
 
-        // 注册命令
         this.addCommand({
             id: 'reorder-images',
             name: '重新整理当前笔记的图片序号',
@@ -30,8 +28,11 @@ class LocalImageManager extends Plugin {
             callback: () => this.convertNoteLinksFormat(),
         });
 
-        // ========== 注册编辑器右键菜单 ==========
+        // 编辑器文本链接右键菜单（保留）
         this.registerEvent(this.app.workspace.on('editor-menu', this.handleEditorMenu.bind(this)));
+
+        // 实时预览图片右键菜单（仅包含插件功能）
+        this.registerDomEvent(document, 'contextmenu', this.handleDocumentContextMenu.bind(this));
     }
 
     onunload() { }
@@ -49,84 +50,155 @@ class LocalImageManager extends Plugin {
     }
 
     // ========================================================================
-    // 右键菜单处理
+    // 右键菜单：编辑器文本链接（保留）
     // ========================================================================
     handleEditorMenu(menu, editor, view) {
-        // 获取当前光标所在行
         const cursor = editor.getCursor();
         const line = editor.getLine(cursor.line);
         if (!line) return;
 
-        // 匹配图片链接（Wiki 或 Markdown 格式）
         const linkRegex = /(?:!\[\[([^\]]+)\]\]|!\[[^\]]*\]\(([^)]+)\))/;
         const match = line.match(linkRegex);
         if (!match) return;
 
-        // 提取链接路径
         const linkPath = match[1] || match[2];
         if (!linkPath) return;
 
-        // 解析文件
         const noteFile = view.file;
         if (!noteFile) return;
         const file = this.app.metadataCache.getFirstLinkpathDest(linkPath, noteFile.path);
         if (!file) return;
 
-        // 只处理由本插件管理的图片（文件名格式：层级-序号.扩展名）
         const nameRegex = /^\d+(?:\.\d+)*-\d+\.\w+$/;
         if (!nameRegex.test(file.name)) return;
 
-        // ----- 菜单项1：重新整理整个笔记 -----
         menu.addItem((item) => {
             item.setTitle('重新整理本笔记图片序号')
                 .setIcon('sort-desc')
-                .onClick(() => {
-                    this.reorderCurrentNoteImages();
-                });
+                .onClick(() => this.reorderCurrentNoteImages());
         });
 
-        // ----- 菜单项2：删除该图片（文件与链接） -----
         menu.addItem((item) => {
             item.setTitle('删除此图片（文件与链接）')
                 .setIcon('trash')
                 .onClick(async () => {
-                    // 确认删除
                     const confirmModal = new ConfirmationModal(
                         this.app,
                         '确认删除',
-                        `确定要删除图片 "${file.name}" 并从笔记中移除链接吗？\n此操作会将文件移至回收站。`
+                        `确定要删除图片 "${file.name}" 并从笔记中移除所有链接吗？\n此操作会将文件移至回收站。`
                     );
                     const confirmed = await new Promise(resolve => {
                         confirmModal.open();
                         confirmModal.onClose = () => resolve(confirmModal.confirmed);
                     });
                     if (!confirmed) return;
-
-                    // 执行删除
-                    await this.deleteImageFileAndLink(editor, line, match[0], file);
+                    await this.removeAllLinksToFileAndDelete(view, file);
                 });
         });
     }
 
     // ========================================================================
-    // 删除图片文件与链接
+    // 右键菜单：实时预览图片（仅包含插件特有功能）
     // ========================================================================
-    async deleteImageFileAndLink(editor, line, fullMatch, file) {
-        // 1. 从笔记中移除链接（替换为空字符串）
-        const newLine = line.replace(fullMatch, '').trim();
-        const cursor = editor.getCursor();
-        editor.setLine(cursor.line, newLine);
+    handleDocumentContextMenu(evt) {
+        const target = evt.target;
+        if (!(target instanceof Element)) return;
 
-        // 2. 将文件移至回收站
+        const view = this.app.workspace.getActiveViewOfType(require('obsidian').MarkdownView);
+        if (!view) return;
+
+        const container = view.contentEl;
+        if (!container.contains(target)) return;
+
+        const img = target.closest('img');
+        if (!img) return;
+
+        let linkPath = img.getAttribute('data-href') || img.getAttribute('src');
+        if (!linkPath) return;
+
+        const noteFile = view.file;
+        if (!noteFile) return;
+
+        // 解析文件
+        let file = this.app.metadataCache.getFirstLinkpathDest(linkPath, noteFile.path);
+        if (!file) {
+            const fileName = linkPath.split('/').pop().split('?')[0];
+            if (fileName) {
+                const allFiles = this.app.vault.getFiles();
+                for (const f of allFiles) {
+                    if (f.name === fileName && /^\d+(?:\.\d+)*-\d+\.\w+$/.test(f.name)) {
+                        file = f;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!file) return;
+
+        const nameRegex = /^\d+(?:\.\d+)*-\d+\.\w+$/;
+        if (!nameRegex.test(file.name)) return;
+
+        // 阻止默认菜单，显示自定义菜单
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        const menu = new Menu();
+
+        // 只添加插件特有的功能
+        menu.addItem((item) => {
+            item.setTitle('重新整理本笔记图片序号')
+                .setIcon('sort-desc')
+                .onClick(() => this.reorderCurrentNoteImages());
+        });
+
+        menu.addItem((item) => {
+            item.setTitle('删除此图片（文件与链接）')
+                .setIcon('trash')
+                .onClick(async () => {
+                    const confirmModal = new ConfirmationModal(
+                        this.app,
+                        '确认删除',
+                        `确定要删除图片 "${file.name}" 并从笔记中移除所有链接吗？\n此操作会将文件移至回收站。`
+                    );
+                    const confirmed = await new Promise(resolve => {
+                        confirmModal.open();
+                        confirmModal.onClose = () => resolve(confirmModal.confirmed);
+                    });
+                    if (!confirmed) return;
+                    await this.removeAllLinksToFileAndDelete(view, file);
+                });
+        });
+
+        menu.showAtMouseEvent(evt);
+    }
+
+    // ========================================================================
+    // 删除图片文件并移除当前笔记中所有指向该文件的链接
+    // ========================================================================
+    async removeAllLinksToFileAndDelete(view, file) {
+        const noteFile = view.file;
+        if (!noteFile) return;
+
+        let content = await this.app.vault.read(noteFile);
+        const relativePath = this.getSafeRelativePath(noteFile, file.path);
+        const escaped = relativePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`(?:!\\[\\[${escaped}\\]\\]|!\\[[^\\]]*\\]\\(${escaped}\\))`, 'g');
+        const newContent = content.replace(regex, '');
+
+        if (newContent !== content) {
+            await this.app.vault.modify(noteFile, newContent);
+            new Notice(`已从笔记中移除 ${file.name} 的所有链接。`);
+        } else {
+            new Notice(`未找到 ${file.name} 的链接。`);
+        }
+
         try {
-            // Obsidian 0.15.0+ 支持 vault.trash 方法
             if (this.app.vault.trash) {
                 await this.app.vault.trash(file, true);
-                new Notice(`已删除文件: ${file.name}`);
+                new Notice(`已删除文件: ${file.name}（已移至回收站）`);
             } else {
-                // 旧版本回退到直接删除（不经过回收站）
                 await this.app.vault.delete(file);
-                new Notice(`已删除文件: ${file.name}（直接删除，未进回收站）`);
+                new Notice(`已删除文件: ${file.name}（直接删除）`);
             }
         } catch (err) {
             console.error('删除文件失败:', err);
@@ -135,18 +207,15 @@ class LocalImageManager extends Plugin {
     }
 
     // ========================================================================
-    // 安全生成相对路径（纯手动构建，不依赖 Obsidian API）
+    // 安全生成相对路径（纯手动构建）
     // ========================================================================
     getSafeRelativePath(noteFile, targetPath) {
         const noteParts = noteFile.path.split('/').filter(p => p);
         const targetParts = targetPath.split('/').filter(p => p);
-
-        // 找到共同前缀长度
         let commonIndex = 0;
         while (commonIndex < noteParts.length && commonIndex < targetParts.length && noteParts[commonIndex] === targetParts[commonIndex]) {
             commonIndex++;
         }
-
         const upCount = noteParts.length - commonIndex;
         const downParts = targetParts.slice(commonIndex);
         const relativeParts = [];
@@ -156,8 +225,7 @@ class LocalImageManager extends Plugin {
     }
 
     // ========================================================================
-    // 以下函数与之前相同（粘贴、拖拽、保存、生成文件名、计数器、整理、转换等）
-    // 为保持完整，全部列出（仅移除了 fileToLinktext 调用）
+    // 以下为原有功能（粘贴、拖拽、保存、生成文件名、计数器、整理、转换等）
     // ========================================================================
 
     // ========== 处理粘贴 ==========
@@ -166,7 +234,6 @@ class LocalImageManager extends Plugin {
         if (!files || files.length === 0) return;
         const imageFile = Array.from(files).find(file => file.type.startsWith('image/'));
         if (!imageFile) return;
-
         if (this.settings.uploadOnPaste === 'ask') {
             const confirmed = await new Promise(resolve => {
                 const modal = new ConfirmationModal(this.app, '保存图片到本地？', '是否将图片保存到本地并插入链接？');
@@ -175,7 +242,6 @@ class LocalImageManager extends Plugin {
             });
             if (!confirmed) return;
         }
-
         evt.preventDefault();
         await this.saveImageLocally(imageFile);
     }
@@ -186,7 +252,6 @@ class LocalImageManager extends Plugin {
         if (!files || files.length === 0) return;
         const imageFile = Array.from(files).find(file => file.type.startsWith('image/'));
         if (!imageFile) return;
-
         if (this.settings.uploadOnPaste === 'ask') {
             const confirmed = await new Promise(resolve => {
                 const modal = new ConfirmationModal(this.app, '保存图片到本地？', '是否将图片保存到本地并插入链接？');
@@ -195,7 +260,6 @@ class LocalImageManager extends Plugin {
             });
             if (!confirmed) return;
         }
-
         evt.preventDefault();
         await this.saveImageLocally(imageFile);
     }
@@ -435,7 +499,7 @@ class LocalImageManager extends Plugin {
     }
 
     // ========================================================================
-    // 重新整理当前笔记的图片序号（强制更新名称，无冲突后缀）
+    // 重新整理当前笔记的图片序号
     // ========================================================================
     async reorderCurrentNoteImages() {
         const activeView = this.app.workspace.getActiveViewOfType(require('obsidian').MarkdownView);
