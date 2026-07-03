@@ -2,9 +2,10 @@ const { Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile } = require('o
 
 // ========== 默认设置 ==========
 const DEFAULT_SETTINGS = {
-    baseFolder: 'Assets/Image',
-    maxHeadingDepth: 6,
-    uploadOnPaste: 'always',
+    baseFolder: 'Assets/Image',        // 基础存储目录
+    maxHeadingDepth: 6,                // 文件名最大标题深度
+    uploadOnPaste: 'always',           // 'always' 或 'ask'
+    linkFormat: 'wiki',                // 'wiki' 或 'markdown'
 };
 
 // ========== 主插件类 ==========
@@ -12,24 +13,152 @@ class LocalImageManager extends Plugin {
     async onload() {
         await this.loadSettings();
         this.addSettingTab(new SettingTab(this.app, this));
+
+        // 注册粘贴和拖拽事件
         this.registerEvent(this.app.workspace.on('editor-paste', this.handlePaste.bind(this)));
         this.registerEvent(this.app.workspace.on('editor-drop', this.handleDrop.bind(this)));
+
+        // 注册命令
         this.addCommand({
             id: 'reorder-images',
             name: '重新整理当前笔记的图片序号',
             callback: () => this.reorderCurrentNoteImages(),
         });
+        this.addCommand({
+            id: 'convert-link-format',
+            name: '将当前笔记图片链接转换为默认格式',
+            callback: () => this.convertNoteLinksFormat(),
+        });
+
+        // ========== 注册编辑器右键菜单 ==========
+        this.registerEvent(this.app.workspace.on('editor-menu', this.handleEditorMenu.bind(this)));
     }
 
     onunload() { }
 
+    // ========== 加载/保存设置 ==========
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        if (!this.settings.imageCounters) {
+            this.settings.imageCounters = {};
+            await this.saveSettings();
+        }
     }
-
     async saveSettings() {
         await this.saveData(this.settings);
     }
+
+    // ========================================================================
+    // 右键菜单处理
+    // ========================================================================
+    handleEditorMenu(menu, editor, view) {
+        // 获取当前光标所在行
+        const cursor = editor.getCursor();
+        const line = editor.getLine(cursor.line);
+        if (!line) return;
+
+        // 匹配图片链接（Wiki 或 Markdown 格式）
+        const linkRegex = /(?:!\[\[([^\]]+)\]\]|!\[[^\]]*\]\(([^)]+)\))/;
+        const match = line.match(linkRegex);
+        if (!match) return;
+
+        // 提取链接路径
+        const linkPath = match[1] || match[2];
+        if (!linkPath) return;
+
+        // 解析文件
+        const noteFile = view.file;
+        if (!noteFile) return;
+        const file = this.app.metadataCache.getFirstLinkpathDest(linkPath, noteFile.path);
+        if (!file) return;
+
+        // 只处理由本插件管理的图片（文件名格式：层级-序号.扩展名）
+        const nameRegex = /^\d+(?:\.\d+)*-\d+\.\w+$/;
+        if (!nameRegex.test(file.name)) return;
+
+        // ----- 菜单项1：重新整理整个笔记 -----
+        menu.addItem((item) => {
+            item.setTitle('重新整理本笔记图片序号')
+                .setIcon('sort-desc')
+                .onClick(() => {
+                    this.reorderCurrentNoteImages();
+                });
+        });
+
+        // ----- 菜单项2：删除该图片（文件与链接） -----
+        menu.addItem((item) => {
+            item.setTitle('删除此图片（文件与链接）')
+                .setIcon('trash')
+                .onClick(async () => {
+                    // 确认删除
+                    const confirmModal = new ConfirmationModal(
+                        this.app,
+                        '确认删除',
+                        `确定要删除图片 "${file.name}" 并从笔记中移除链接吗？\n此操作会将文件移至回收站。`
+                    );
+                    const confirmed = await new Promise(resolve => {
+                        confirmModal.open();
+                        confirmModal.onClose = () => resolve(confirmModal.confirmed);
+                    });
+                    if (!confirmed) return;
+
+                    // 执行删除
+                    await this.deleteImageFileAndLink(editor, line, match[0], file);
+                });
+        });
+    }
+
+    // ========================================================================
+    // 删除图片文件与链接
+    // ========================================================================
+    async deleteImageFileAndLink(editor, line, fullMatch, file) {
+        // 1. 从笔记中移除链接（替换为空字符串）
+        const newLine = line.replace(fullMatch, '').trim();
+        const cursor = editor.getCursor();
+        editor.setLine(cursor.line, newLine);
+
+        // 2. 将文件移至回收站
+        try {
+            // Obsidian 0.15.0+ 支持 vault.trash 方法
+            if (this.app.vault.trash) {
+                await this.app.vault.trash(file, true);
+                new Notice(`已删除文件: ${file.name}`);
+            } else {
+                // 旧版本回退到直接删除（不经过回收站）
+                await this.app.vault.delete(file);
+                new Notice(`已删除文件: ${file.name}（直接删除，未进回收站）`);
+            }
+        } catch (err) {
+            console.error('删除文件失败:', err);
+            new Notice(`删除文件失败: ${err.message}`);
+        }
+    }
+
+    // ========================================================================
+    // 安全生成相对路径（纯手动构建，不依赖 Obsidian API）
+    // ========================================================================
+    getSafeRelativePath(noteFile, targetPath) {
+        const noteParts = noteFile.path.split('/').filter(p => p);
+        const targetParts = targetPath.split('/').filter(p => p);
+
+        // 找到共同前缀长度
+        let commonIndex = 0;
+        while (commonIndex < noteParts.length && commonIndex < targetParts.length && noteParts[commonIndex] === targetParts[commonIndex]) {
+            commonIndex++;
+        }
+
+        const upCount = noteParts.length - commonIndex;
+        const downParts = targetParts.slice(commonIndex);
+        const relativeParts = [];
+        for (let i = 0; i < upCount; i++) relativeParts.push('..');
+        relativeParts.push(...downParts);
+        return relativeParts.join('/');
+    }
+
+    // ========================================================================
+    // 以下函数与之前相同（粘贴、拖拽、保存、生成文件名、计数器、整理、转换等）
+    // 为保持完整，全部列出（仅移除了 fileToLinktext 调用）
+    // ========================================================================
 
     // ========== 处理粘贴 ==========
     async handlePaste(evt) {
@@ -50,15 +179,14 @@ class LocalImageManager extends Plugin {
         evt.preventDefault();
         await this.saveImageLocally(imageFile);
     }
-    // ========== 处理拖拽图片 ==========
+
+    // ========== 处理拖拽 ==========
     async handleDrop(evt) {
-        // 从拖拽事件中获取文件列表
         const files = evt.dataTransfer?.files;
         if (!files || files.length === 0) return;
         const imageFile = Array.from(files).find(file => file.type.startsWith('image/'));
         if (!imageFile) return;
 
-        // 与粘贴相同的确认逻辑（如果设置 ask）
         if (this.settings.uploadOnPaste === 'ask') {
             const confirmed = await new Promise(resolve => {
                 const modal = new ConfirmationModal(this.app, '保存图片到本地？', '是否将图片保存到本地并插入链接？');
@@ -68,11 +196,11 @@ class LocalImageManager extends Plugin {
             if (!confirmed) return;
         }
 
-        evt.preventDefault(); // 阻止浏览器默认行为（如在新标签页打开）
+        evt.preventDefault();
         await this.saveImageLocally(imageFile);
     }
 
-    // ========== 保存图片 ==========
+    // ========== 保存图片到本地 ==========
     async saveImageLocally(imageFile) {
         const activeView = this.app.workspace.getActiveViewOfType(require('obsidian').MarkdownView);
         if (!activeView) {
@@ -83,7 +211,6 @@ class LocalImageManager extends Plugin {
         const noteFile = activeView.file;
         if (!noteFile) return;
 
-        // 1. 生成文件名（返回 { fileName, usedFallback }）
         const extension = imageFile.name.split('.').pop() || 'png';
         const noteBasename = noteFile.basename;
         let newFileName, usedFallback;
@@ -98,12 +225,18 @@ class LocalImageManager extends Plugin {
             usedFallback = true;
         }
 
-        // 如果使用了 fallback，给出提示
+        if (!newFileName) {
+            newFileName = this.fallbackFileName(extension, noteBasename);
+            usedFallback = true;
+        }
+        if (!newFileName.includes('.')) {
+            newFileName += '.png';
+        }
+
         if (usedFallback) {
             new Notice('当前光标位置无有效标题，建议在标题层级下粘贴图片以获得有序命名。', 5000);
         }
 
-        // 2. 确定存储路径（按笔记路径存放）
         const notePath = noteFile.path;
         const baseFolder = this.settings.baseFolder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
         const noteName = noteFile.basename;
@@ -115,29 +248,43 @@ class LocalImageManager extends Plugin {
 
         await this.ensureFolderExists(targetFolder);
 
-        // 3. 保存图片（处理重名）
         const arrayBuffer = await imageFile.arrayBuffer();
         let targetPath = `${targetFolder}/${newFileName}`;
         let finalPath = targetPath;
         let counter = 1;
         const adapter = this.app.vault.adapter;
         while (await adapter.exists(finalPath)) {
-            const ext = newFileName.split('.').pop();
+            const ext = newFileName.split('.').pop() || 'png';
             const base = newFileName.slice(0, -(ext.length + 1));
-            finalPath = `${targetFolder}/${base}-${counter}.${ext}`;
+            let newName = `${base}-${counter}.${ext}`;
+            if (!newName.includes('.')) newName += '.png';
+            finalPath = `${targetFolder}/${newName}`;
             counter++;
         }
+
+        console.log(`[DEBUG] 保存图片到: ${finalPath}`);
         await this.app.vault.createBinary(finalPath, arrayBuffer);
 
-        // 4. 插入 Wiki 链接
-        const linkPath = this.app.metadataCache.fileToLinktext(noteFile, finalPath);
-        const linkText = `![[${linkPath}]]`;
-        editor.replaceSelection(linkText);
+        const createdFile = this.app.vault.getAbstractFileByPath(finalPath);
+        if (!createdFile || !(createdFile instanceof TFile)) {
+            console.error(`文件创建失败: ${finalPath}`);
+            new Notice('保存图片失败：文件创建异常。');
+            return;
+        }
 
+        const relativePath = this.getSafeRelativePath(noteFile, finalPath);
+        console.log(`[DEBUG] 相对路径: ${relativePath}`);
+        let linkText;
+        if (this.settings.linkFormat === 'markdown') {
+            linkText = `![](${relativePath})`;
+        } else {
+            linkText = `![[${relativePath}]]`;
+        }
+        editor.replaceSelection(linkText);
         new Notice(`图片已保存到: ${finalPath}`);
     }
 
-    // ========== 生成基于标题层级的文件名（返回对象） ==========
+    // ========== 生成基于标题层级的文件名 ==========
     async generateFileNameFromHeading(editor, noteBasename, extension) {
         const activeFile = this.app.workspace.getActiveFile();
         if (!activeFile) {
@@ -153,7 +300,6 @@ class LocalImageManager extends Plugin {
         const cursor = editor.getCursor();
         const cursorLine = cursor.line;
 
-        // 找到光标所在标题
         let currentHeading = null;
         for (let i = headings.length - 1; i >= 0; i--) {
             const heading = headings[i];
@@ -167,7 +313,6 @@ class LocalImageManager extends Plugin {
             return { fileName: this.fallbackFileName(extension, noteBasename), usedFallback: true };
         }
 
-        // 计算编号
         const counters = [];
         const headingToPath = new Map();
         for (const h of headings) {
@@ -184,14 +329,12 @@ class LocalImageManager extends Plugin {
             return { fileName: this.fallbackFileName(extension, noteBasename), usedFallback: true };
         }
 
-        // 限制最大深度
         const maxDepth = this.settings.maxHeadingDepth || 6;
         const parts = targetPath.split('.');
         if (parts.length > maxDepth) {
             targetPath = parts.slice(0, maxDepth).join('.');
         }
 
-        // 获取计数器
         const notePath = activeFile.path;
         const counter = await this.getNextImageCounter(notePath, targetPath);
 
@@ -225,9 +368,307 @@ class LocalImageManager extends Plugin {
         } catch (_) { }
     }
 
-    // ========== 尚未实现 ==========
+    // ========================================================================
+    // 转换当前笔记中的图片链接格式
+    // ========================================================================
+    async convertNoteLinksFormat() {
+        const activeView = this.app.workspace.getActiveViewOfType(require('obsidian').MarkdownView);
+        if (!activeView) {
+            new Notice('没有打开的笔记。');
+            return;
+        }
+        const noteFile = activeView.file;
+        if (!noteFile) return;
+
+        let content = await this.app.vault.read(noteFile);
+        const notePath = noteFile.path;
+
+        const linkRegex = /(?:!\[\[([^\]]+)\]\]|!\[[^\]]*\]\(([^)]+)\))/g;
+        let match;
+        const replacements = [];
+
+        while ((match = linkRegex.exec(content)) !== null) {
+            const linkPath = match[1] || match[2];
+            if (!linkPath) continue;
+            const file = this.app.metadataCache.getFirstLinkpathDest(linkPath, notePath);
+            if (!file) continue;
+
+            const nameRegex = /^\d+(?:\.\d+)*-\d+\.\w+$/;
+            if (!nameRegex.test(file.name)) continue;
+
+            const fullMatch = match[0];
+            const newRelativePath = this.getSafeRelativePath(noteFile, file.path);
+            let newFullMatch;
+            if (this.settings.linkFormat === 'markdown') {
+                newFullMatch = `![](${newRelativePath})`;
+            } else {
+                newFullMatch = `![[${newRelativePath}]]`;
+            }
+
+            if (fullMatch !== newFullMatch) {
+                replacements.push({ old: fullMatch, new: newFullMatch });
+            }
+        }
+
+        if (replacements.length === 0) {
+            new Notice('没有需要转换的链接（已全部为目标格式）。');
+            return;
+        }
+
+        const confirmModal = new ConfirmationModal(
+            this.app,
+            '转换链接格式',
+            `将转换 ${replacements.length} 个图片链接为 ${this.settings.linkFormat === 'markdown' ? 'Markdown' : 'Wiki'} 格式。\n确定继续吗？`
+        );
+        const confirmed = await new Promise(resolve => {
+            confirmModal.open();
+            confirmModal.onClose = () => resolve(confirmModal.confirmed);
+        });
+        if (!confirmed) return;
+
+        let updatedContent = content;
+        for (const rep of replacements) {
+            updatedContent = updatedContent.split(rep.old).join(rep.new);
+        }
+        await this.app.vault.modify(noteFile, updatedContent);
+        new Notice(`已转换 ${replacements.length} 个图片链接。`);
+    }
+
+    // ========================================================================
+    // 重新整理当前笔记的图片序号（强制更新名称，无冲突后缀）
+    // ========================================================================
     async reorderCurrentNoteImages() {
-        new Notice('此功能尚未实现。');
+        const activeView = this.app.workspace.getActiveViewOfType(require('obsidian').MarkdownView);
+        if (!activeView) {
+            new Notice('没有打开的笔记。');
+            return;
+        }
+        const noteFile = activeView.file;
+        if (!noteFile) {
+            new Notice('没有找到文件。');
+            return;
+        }
+
+        let content = await this.app.vault.read(noteFile);
+        const notePath = noteFile.path;
+
+        const cache = this.app.metadataCache.getFileCache(noteFile, true);
+        const headings = cache?.headings;
+        if (!headings || headings.length === 0) {
+            new Notice('当前笔记没有标题，无法重新整理。');
+            return;
+        }
+
+        const getHeadingPathAtLine = (lineNumber) => {
+            let currentHeading = null;
+            for (let i = headings.length - 1; i >= 0; i--) {
+                const h = headings[i];
+                if (h.position.start.line <= lineNumber) {
+                    currentHeading = h;
+                    break;
+                }
+            }
+            if (!currentHeading) return "root";
+
+            const counters = [];
+            const headingToPath = new Map();
+            for (const h of headings) {
+                const level = h.level;
+                while (counters.length < level) counters.push(0);
+                if (counters.length > level) counters.length = level;
+                counters[level - 1]++;
+                const path = counters.slice(0, level).join('.');
+                headingToPath.set(h, path);
+            }
+            const fullPath = headingToPath.get(currentHeading);
+            if (!fullPath) return "root";
+            const maxDepth = this.settings.maxHeadingDepth || 6;
+            const parts = fullPath.split('.');
+            return parts.slice(0, maxDepth).join('.');
+        };
+
+        const linkRegex = /(?:!\[\[([^\]]+)\]\]|!\[[^\]]*\]\(([^)]+)\))/g;
+        const matches = [];
+        let match;
+        while ((match = linkRegex.exec(content)) !== null) {
+            const linkPath = match[1] || match[2];
+            if (!linkPath) continue;
+            const file = this.app.metadataCache.getFirstLinkpathDest(linkPath, notePath);
+            if (!file) continue;
+
+            const nameRegex = /^(\d+(?:\.\d+)*|root)-(\d+)\.(\w+)$/;
+            const nameMatch = file.name.match(nameRegex);
+            if (!nameMatch) continue;
+
+            const oldHeadingPath = nameMatch[1];
+            const currentNumber = parseInt(nameMatch[2], 10);
+            const ext = nameMatch[3];
+            const fullMatch = match[0];
+            const index = match.index;
+            const lineNumber = content.substring(0, index).split('\n').length - 1;
+            const newHeadingPath = getHeadingPathAtLine(lineNumber);
+
+            matches.push({
+                fullMatch,
+                linkPath,
+                file,
+                oldHeadingPath,
+                newHeadingPath,
+                currentNumber,
+                ext,
+                fileName: file.name,
+                index,
+                lineNumber,
+            });
+        }
+
+        if (matches.length === 0) {
+            new Notice('当前笔记中没有找到由本插件管理的图片。');
+            return;
+        }
+
+        const groups = new Map();
+        for (const info of matches) {
+            const key = info.newHeadingPath;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(info);
+        }
+
+        const layersToProcess = [];
+        for (const [headingPath, infos] of groups.entries()) {
+            infos.sort((a, b) => a.index - b.index);
+
+            let isContinuous = true;
+            for (let i = 0; i < infos.length; i++) {
+                if (infos[i].currentNumber !== i + 1) {
+                    isContinuous = false;
+                    break;
+                }
+            }
+
+            let allMatch = true;
+            for (const info of infos) {
+                if (info.oldHeadingPath !== headingPath) {
+                    allMatch = false;
+                    break;
+                }
+            }
+
+            if (!isContinuous || !allMatch) {
+                layersToProcess.push({ headingPath, infos });
+            } else {
+                console.log(`层级 ${headingPath} 序号连续且层级匹配，跳过。`);
+            }
+        }
+
+        if (layersToProcess.length === 0) {
+            new Notice('所有图片的序号和层级均已正确，无需整理。');
+            return;
+        }
+
+        const totalImages = layersToProcess.reduce((sum, layer) => sum + layer.infos.length, 0);
+        const groupCount = layersToProcess.length;
+        const confirmModal = new ConfirmationModal(
+            this.app,
+            '重新整理图片序号',
+            `将重新整理 ${totalImages} 张图片（共 ${groupCount} 个层级），使每个层级的编号从 1 开始连续，并修正层级前缀。\n确定继续吗？`
+        );
+        const confirmed = await new Promise(resolve => {
+            confirmModal.open();
+            confirmModal.onClose = () => resolve(confirmModal.confirmed);
+        });
+        if (!confirmed) return;
+
+        const renameOperations = [];
+        const replacements = [];
+
+        for (const { headingPath, infos } of layersToProcess) {
+            let newNumber = 1;
+            for (const info of infos) {
+                const newBase = `${headingPath}-${newNumber}`;
+                const newFileName = `${newBase}.${info.ext}`;
+                const dirPath = info.file.path.substring(0, info.file.path.lastIndexOf('/') + 1);
+                const newPath = `${dirPath}${newFileName}`;
+
+                if (info.file.path !== newPath) {
+                    renameOperations.push({ oldFile: info.file, newPath });
+                }
+
+                const newRelativePath = this.getSafeRelativePath(noteFile, newPath);
+                console.log(`[DEBUG] ${info.file.name} -> ${newPath}, 相对路径: ${newRelativePath}`);
+                let newFullMatch;
+                if (this.settings.linkFormat === 'markdown') {
+                    newFullMatch = `![](${newRelativePath})`;
+                } else {
+                    newFullMatch = `![[${newRelativePath}]]`;
+                }
+                replacements.push({
+                    oldFullMatch: info.fullMatch,
+                    newFullMatch,
+                });
+
+                newNumber++;
+            }
+        }
+
+        renameOperations.sort((a, b) => {
+            const numA = parseInt(a.newPath.match(/-(\d+)\./)[1], 10);
+            const numB = parseInt(b.newPath.match(/-(\d+)\./)[1], 10);
+            return numB - numA;
+        });
+
+        let renamedCount = 0;
+        if (renameOperations.length > 0) {
+            const progressNotice = new Notice(`正在重命名文件... (0/${renameOperations.length})`, 0);
+            for (let i = 0; i < renameOperations.length; i++) {
+                const op = renameOperations[i];
+                try {
+                    await this.app.vault.rename(op.oldFile, op.newPath);
+                    renamedCount++;
+                } catch (err) {
+                    console.error(`重命名失败: ${op.oldFile.path} -> ${op.newPath}`, err);
+                    new Notice(`重命名 ${op.oldFile.name} 失败，跳过该文件。`);
+                    const idx = replacements.findIndex(r => r.oldFullMatch === `![[${op.oldFile.path}]]`);
+                    if (idx !== -1) replacements.splice(idx, 1);
+                }
+                if (i % 5 === 0 || i === renameOperations.length - 1) {
+                    progressNotice.setMessage(`正在重命名文件... (${i + 1}/${renameOperations.length})`);
+                }
+            }
+            progressNotice.hide();
+            new Notice(`已重命名 ${renamedCount} 个文件。`);
+        } else {
+            new Notice('无需重命名文件（所有路径均已正确）。');
+        }
+
+        if (replacements.length > 0) {
+            let updatedContent = content;
+            for (const rep of replacements) {
+                updatedContent = updatedContent.split(rep.oldFullMatch).join(rep.newFullMatch);
+            }
+            if (updatedContent !== content) {
+                await this.app.vault.modify(noteFile, updatedContent);
+                new Notice(`已更新 ${replacements.length} 个图片链接并统一格式。`);
+            } else {
+                new Notice('没有链接需要更新。');
+            }
+        }
+
+        let countersUpdated = 0;
+        for (const [headingPath, infos] of groups.entries()) {
+            const key = `${noteFile.path}|${headingPath}`;
+            const newCount = infos.length;
+            if (this.settings.imageCounters[key] !== newCount) {
+                this.settings.imageCounters[key] = newCount;
+                countersUpdated++;
+            }
+        }
+        if (countersUpdated > 0) {
+            await this.saveSettings();
+            new Notice(`已更新 ${countersUpdated} 个层级的计数器。`);
+        }
+
+        new Notice('重新整理完成！');
     }
 }
 
@@ -299,6 +740,18 @@ class SettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.uploadOnPaste)
                 .onChange(async (value) => {
                     this.plugin.settings.uploadOnPaste = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('默认链接格式')
+            .setDesc('选择插入图片时使用的链接格式。执行“重新整理”或“转换格式”命令时，也会统一为这个格式。')
+            .addDropdown(dropdown => dropdown
+                .addOption('wiki', 'Wiki 链接 (![[]])')
+                .addOption('markdown', 'Markdown 链接 (![]())')
+                .setValue(this.plugin.settings.linkFormat)
+                .onChange(async (value) => {
+                    this.plugin.settings.linkFormat = value;
                     await this.plugin.saveSettings();
                 }));
     }
